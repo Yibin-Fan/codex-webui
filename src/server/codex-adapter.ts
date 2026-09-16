@@ -18,6 +18,7 @@ interface PendingCall {
 
 export interface CodexAdapterOptions {
   command?: string;
+  commandArgs?: string[];
   requestTimeoutMs?: number;
 }
 
@@ -30,11 +31,13 @@ export class CodexAdapter extends EventEmitter {
   private started = false;
   private available = false;
   private readonly command: string;
+  private readonly commandArgs: string[];
   private readonly requestTimeoutMs: number;
 
   constructor(options: CodexAdapterOptions = {}) {
     super();
     this.command = options.command ?? 'codex';
+    this.commandArgs = options.commandArgs ?? ['app-server', '--listen', 'stdio://'];
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
 
@@ -47,7 +50,7 @@ export class CodexAdapter extends EventEmitter {
     this.started = true;
 
     try {
-      this.child = spawn(this.command, ['app-server', '--listen', 'stdio://'], {
+      this.child = spawn(this.command, this.commandArgs, {
         shell: false,
         stdio: 'pipe'
       });
