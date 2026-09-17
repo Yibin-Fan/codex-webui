@@ -75,7 +75,7 @@ test('requires bootstrap authentication, a same-origin CSRF token, and a matchin
   }
 });
 
-test('limits turns to listed workspace threads and de-duplicates a completed submission', async () => {
+test('requires history threads to be resumed before turns and de-duplicates a completed submission', async () => {
   const adapter = new FakeAdapter();
   const webUi = await createWebUi({ workspace: '/workspace', bootstrapToken: 'test-bootstrap-token', adapter });
   try {
@@ -83,12 +83,20 @@ test('limits turns to listed workspace threads and de-duplicates a completed sub
 
     const unknown = await webUi.app.inject({ method: 'GET', url: '/api/threads/other-thread', headers: { ...localHeaders, cookie: session.cookie } });
     assert.equal(unknown.statusCode, 404);
-    assert.deepEqual(adapter.calls, []);
+    assert.equal(adapter.calls.length, 0);
 
     const listed = await webUi.app.inject({ method: 'GET', url: '/api/threads', headers: { ...localHeaders, cookie: session.cookie } });
     assert.equal(listed.statusCode, 200);
 
     const payload = { text: 'Summarize this repository', clientRequestId: 'client-request-1' };
+    const notResumed = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: mutationHeaders(session), payload });
+    assert.equal(notResumed.statusCode, 409);
+    assert.equal(adapter.calls.filter((method) => method === 'turn/start').length, 0);
+
+    const resumed = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/resume', headers: mutationHeaders(session), payload: {} });
+    assert.equal(resumed.statusCode, 200);
+    assert.ok(adapter.calls.includes('thread/resume'));
+
     const rejectedOrigin = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: { ...mutationHeaders(session), origin: 'http://example.test' }, payload });
     assert.equal(rejectedOrigin.statusCode, 403);
     const first = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: mutationHeaders(session), payload });

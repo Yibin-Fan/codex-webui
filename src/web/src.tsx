@@ -80,11 +80,12 @@ function App() {
     if (threadId) await loadThread(threadId);
   }
 
-  async function loadThread(threadId: string) {
+  async function loadThread(threadId: string, resume = true) {
     setActiveThread(threadId);
     setError(undefined);
     try {
       const result = await request<Record<string, unknown>>(`/api/threads/${encodeURIComponent(threadId)}`);
+      if (resume) await request(`/api/threads/${encodeURIComponent(threadId)}/resume`, { method: 'POST', body: '{}' });
       const entries = historyEvents(result, threadId);
       setHistory((current) => ({ ...current, [threadId]: entries }));
       setToolProjection((current) => ({
@@ -205,7 +206,7 @@ function App() {
       const result = await request<{ thread?: Thread }>('/api/threads', { method: 'POST', body: '{}' });
       if (result.thread) {
         setThreads((current) => [result.thread!, ...current]);
-        await loadThread(result.thread.id);
+        await loadThread(result.thread.id, false);
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法创建会话。');

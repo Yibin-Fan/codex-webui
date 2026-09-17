@@ -34,6 +34,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   const bootstrapToken = options.bootstrapToken ?? randomBytes(32).toString('base64url');
   const authenticatedSessions = new Map<string, string>();
   const sessions = new Set<string>();
+  const loadedThreads = new Set<string>();
   const activeTurns = new Map<string, string>();
   const submittedRequests = new Map<string, { threadId: string; payloadHash: string; response?: JsonObject }>();
   const interactions = new Map<string, PendingInteraction>();
@@ -104,6 +105,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   adapter.on('unavailable', (error: Error) => {
     interactions.clear();
     activeTurns.clear();
+    loadedThreads.clear();
     epoch = randomBytes(16).toString('hex');
     seq = 0;
     eventBuffer.clear();
@@ -181,7 +183,10 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
     try {
       const result = await adapter.request('thread/start', { cwd: options.workspace });
       const thread = result.thread as JsonObject | undefined;
-      if (typeof thread?.id === 'string') sessions.add(thread.id);
+      if (typeof thread?.id === 'string') {
+        sessions.add(thread.id);
+        loadedThreads.add(thread.id);
+      }
       return reply.code(201).send(result);
     } catch (error) {
       return upstreamError(reply, error);
@@ -206,6 +211,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
     try {
       const result = await adapter.request('thread/resume', { threadId, cwd: options.workspace });
       sessions.add(threadId);
+      loadedThreads.add(threadId);
       return result;
     } catch (error) {
       return upstreamError(reply, error);
@@ -216,6 +222,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
     if (!authenticateMutation(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
     if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
+    if (!loadedThreads.has(threadId)) return reply.code(409).send({ code: 'thread_not_resumed', message: 'Resume this thread before starting a turn.' });
     const body = request.body as { text?: unknown; clientRequestId?: unknown };
     if (typeof body?.text !== 'string' || body.text.trim() === '') {
       return reply.code(400).send({ code: 'invalid_request', message: 'text is required.' });
