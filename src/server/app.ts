@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import cookie from '@fastify/cookie';
@@ -31,6 +31,8 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   const adapter = options.adapter ?? new CodexAdapter();
   const bootstrapToken = options.bootstrapToken ?? randomBytes(32).toString('base64url');
   const sessions = new Set<string>();
+  const activeTurns = new Map<string, string>();
+  const submittedRequests = new Map<string, { threadId: string; payloadHash: string; response?: JsonObject }>();
   const interactions = new Map<string, PendingInteraction>();
   const clients = new Set<WebSocket>();
   let seq = 0;
@@ -59,6 +61,12 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   adapter.on('notification', (message: RpcMessage) => {
     const params = message.params ?? {};
     const threadId = typeof params.threadId === 'string' ? params.threadId : undefined;
+    const turn = isJsonObject(params.turn) ? params.turn : undefined;
+    if (message.method === 'turn/started' && threadId && typeof turn?.id === 'string') activeTurns.set(threadId, turn.id);
+    if (message.method === 'turn/completed' && threadId) {
+      const completedTurnId = typeof turn?.id === 'string' ? turn.id : undefined;
+      if (!completedTurnId || activeTurns.get(threadId) === completedTurnId) activeTurns.delete(threadId);
+    }
     emit(`codex.${message.method}`, params, threadId);
   });
   adapter.on('serverRequest', (message: RpcMessage) => {
@@ -111,13 +119,14 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
 
   app.get('/api/status', async (request, reply) => {
     if (!authenticate(request, reply)) return;
-    return { workspace: options.workspace, connection: adapter.isAvailable ? 'ready' : 'unavailable', epoch, protocolVersion: 1 };
+    return { workspace: options.workspace, connection: adapter.isAvailable ? 'ready' : 'unavailable', activeTurns: Object.fromEntries(activeTurns), epoch, protocolVersion: 1 };
   });
 
   app.get('/api/threads', async (request, reply) => {
     if (!authenticate(request, reply)) return;
     try {
       const result = await adapter.request('thread/list', { cwd: options.workspace, limit: 50 });
+      for (const thread of threadList(result)) sessions.add(thread.id);
       return result;
     } catch (error) {
       return upstreamError(reply, error);
@@ -139,6 +148,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   app.get('/api/threads/:threadId', async (request, reply) => {
     if (!authenticate(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
+    if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     try {
       return await adapter.request('thread/read', { threadId, includeTurns: true });
     } catch (error) {
@@ -149,6 +159,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   app.post('/api/threads/:threadId/resume', async (request, reply) => {
     if (!authenticate(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
+    if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     try {
       const result = await adapter.request('thread/resume', { threadId, cwd: options.workspace });
       sessions.add(threadId);
@@ -161,19 +172,37 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   app.post('/api/threads/:threadId/turns', async (request, reply) => {
     if (!authenticate(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
+    if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     const body = request.body as { text?: unknown; clientRequestId?: unknown };
     if (typeof body?.text !== 'string' || body.text.trim() === '') {
       return reply.code(400).send({ code: 'invalid_request', message: 'text is required.' });
     }
     if (body.text.length > 100_000) return reply.code(413).send({ code: 'too_large', message: 'Message exceeds 100,000 characters.' });
+    if (typeof body.clientRequestId !== 'string' || body.clientRequestId.length < 1 || body.clientRequestId.length > 128) {
+      return reply.code(400).send({ code: 'invalid_request', message: 'clientRequestId is required.' });
+    }
+    const requestKey = `${threadId}:${body.clientRequestId}`;
+    const payloadHash = createHash('sha256').update(body.text).digest('hex');
+    const prior = submittedRequests.get(requestKey);
+    if (prior) {
+      if (prior.payloadHash !== payloadHash) return reply.code(409).send({ code: 'request_conflict', message: 'clientRequestId has already been used with different content.' });
+      if (!prior.response) return reply.code(409).send({ code: 'request_in_progress', message: 'The original request is still being submitted.' });
+      return reply.code(202).send(prior.response);
+    }
+    if (activeTurns.has(threadId)) return reply.code(409).send({ code: 'turn_in_progress', message: 'A turn is already running for this thread.', turnId: activeTurns.get(threadId) });
+    submittedRequests.set(requestKey, { threadId, payloadHash });
     try {
       const result = await adapter.request('turn/start', {
         threadId,
-        clientUserMessageId: typeof body.clientRequestId === 'string' ? body.clientRequestId : undefined,
+        clientUserMessageId: body.clientRequestId,
         input: [{ type: 'text', text: body.text }]
       });
+      submittedRequests.set(requestKey, { threadId, payloadHash, response: result });
+      const turn = result.turn;
+      if (isJsonObject(turn) && typeof turn.id === 'string') activeTurns.set(threadId, turn.id);
       return reply.code(202).send(result);
     } catch (error) {
+      submittedRequests.delete(requestKey);
       return upstreamError(reply, error);
     }
   });
@@ -181,6 +210,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   app.post('/api/threads/:threadId/interrupt', async (request, reply) => {
     if (!authenticate(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
+    if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     const body = request.body as { turnId?: unknown };
     if (typeof body?.turnId !== 'string') return reply.code(400).send({ code: 'invalid_request', message: 'turnId is required.' });
     try {
@@ -259,6 +289,11 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
       await app.close();
     }
   };
+}
+
+function threadList(result: JsonObject): Array<{ id: string }> {
+  const data = Array.isArray(result.data) ? result.data : [];
+  return data.filter((thread): thread is { id: string } => isJsonObject(thread) && typeof thread.id === 'string');
 }
 
 function sameToken(left: string, right: string): boolean {

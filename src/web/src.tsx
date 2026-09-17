@@ -31,18 +31,39 @@ function App() {
   const [status, setStatus] = useState('正在连接本地服务…');
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThread, setActiveThread] = useState<string>();
+  const [historyByThread, setHistory] = useState<Record<string, EventRecord[]>>({});
+  const [activeTurns, setActiveTurns] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState('');
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [error, setError] = useState<string>();
 
-  const activeEvents = useMemo(() => events.filter((event) => !activeThread || event.threadId === activeThread), [events, activeThread]);
+  const activeEvents = useMemo(() => [
+    ...(activeThread ? historyByThread[activeThread] ?? [] : []),
+    ...events.filter((event) => !activeThread || event.threadId === activeThread)
+  ], [events, activeThread, historyByThread]);
+  const activeTurnId = activeThread ? activeTurns[activeThread] : undefined;
 
   async function loadThreads() {
     const result = await request<{ data?: Thread[]; threads?: Thread[] }>('/api/threads');
     const next = result.data ?? result.threads ?? [];
     setThreads(next);
-    setActiveThread((current) => current ?? next[0]?.id);
+    const threadId = next[0]?.id;
+    if (threadId) await loadThread(threadId);
+  }
+
+  async function loadThread(threadId: string) {
+    setActiveThread(threadId);
+    setError(undefined);
+    try {
+      const result = await request<Record<string, unknown>>(`/api/threads/${encodeURIComponent(threadId)}`);
+      const entries = historyEvents(result, threadId);
+      setHistory((current) => ({ ...current, [threadId]: entries }));
+      const runningTurn = runningTurnId(result);
+      setActiveTurns((current) => runningTurn ? { ...current, [threadId]: runningTurn } : withoutKey(current, threadId));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '无法读取会话历史。');
+    }
   }
 
   useEffect(() => {
@@ -53,8 +74,9 @@ function App() {
           await fetch('/api/auth/bootstrap', { method: 'POST', headers: { 'X-Bootstrap-Token': token }, credentials: 'same-origin' });
           history.replaceState(null, '', `${location.pathname}${location.search}`);
         }
-        const current = await request<{ connection: string; workspace: string }>('/api/status');
+        const current = await request<{ connection: string; workspace: string; activeTurns?: Record<string, string> }>('/api/status');
         setStatus(`${current.connection === 'ready' ? '已连接' : 'Codex 未连接'} · ${current.workspace}`);
+        setActiveTurns(current.activeTurns ?? {});
         setReady(true);
         await loadThreads();
       } catch (cause) {
@@ -80,6 +102,13 @@ function App() {
         const id = (event.payload as { id: string }).id;
         setInteractions((current) => current.filter((interaction) => interaction.id !== id));
       }
+      if (event.kind === 'codex.turn/started' && event.threadId) {
+        const turnId = (event.payload as { turn?: { id?: unknown } }).turn?.id;
+        if (typeof turnId === 'string') setActiveTurns((current) => ({ ...current, [event.threadId!]: turnId }));
+      }
+      if (event.kind === 'codex.turn/completed' && event.threadId) {
+        setActiveTurns((current) => withoutKey(current, event.threadId!));
+      }
       setEvents((current) => [...current.slice(-499), event]);
     };
     socket.onclose = () => setStatus((current) => `${current} · 实时连接已断开`);
@@ -92,7 +121,7 @@ function App() {
       const result = await request<{ thread?: Thread }>('/api/threads', { method: 'POST', body: '{}' });
       if (result.thread) {
         setThreads((current) => [result.thread!, ...current]);
-        setActiveThread(result.thread.id);
+        await loadThread(result.thread.id);
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法创建会话。');
@@ -100,19 +129,29 @@ function App() {
   }
 
   async function submit() {
-    if (!activeThread || !draft.trim()) return;
+    if (!activeThread || !draft.trim() || activeTurnId) return;
     const text = draft.trim();
     setDraft('');
     setError(undefined);
     try {
-      await request(`/api/threads/${encodeURIComponent(activeThread)}/turns`, {
+      const result = await request<{ turn?: { id?: string } }>(`/api/threads/${encodeURIComponent(activeThread)}/turns`, {
         method: 'POST',
         body: JSON.stringify({ text, clientRequestId: crypto.randomUUID() })
       });
+      if (result.turn?.id) setActiveTurns((current) => ({ ...current, [activeThread]: result.turn!.id! }));
       setEvents((current) => [...current, { type: 'event', kind: 'ui.user_message', payload: { text }, threadId: activeThread, seq: Number.MAX_SAFE_INTEGER }]);
     } catch (cause) {
       setDraft(text);
       setError(cause instanceof Error ? cause.message : '发送失败。');
+    }
+  }
+
+  async function interrupt() {
+    if (!activeThread || !activeTurnId) return;
+    try {
+      await request(`/api/threads/${encodeURIComponent(activeThread)}/interrupt`, { method: 'POST', body: JSON.stringify({ turnId: activeTurnId }) });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '无法停止回合。');
     }
   }
 
@@ -132,7 +171,7 @@ function App() {
       <div className="brand">Codex WebUI</div>
       <button className="primary" onClick={() => void createThread()} disabled={!ready}>新建会话</button>
       <nav aria-label="会话列表">
-        {threads.map((thread) => <button key={thread.id} className={thread.id === activeThread ? 'thread active' : 'thread'} onClick={() => setActiveThread(thread.id)}>{thread.name || thread.id}</button>)}
+        {threads.map((thread) => <button key={thread.id} className={thread.id === activeThread ? 'thread active' : 'thread'} onClick={() => void loadThread(thread.id)}>{thread.name || thread.id}</button>)}
       </nav>
     </aside>
     <section className="conversation">
@@ -143,8 +182,8 @@ function App() {
         {activeEvents.length === 0 && <p className="empty">选择或新建会话后开始工作。</p>}
       </div>
       <div className="composer">
-        <textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="描述你希望 Codex 完成的工作…" onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); void submit(); } }} />
-        <button className="primary" onClick={() => void submit()} disabled={!activeThread || !draft.trim()}>发送</button>
+        <textarea value={draft} disabled={Boolean(activeTurnId)} onChange={(event) => setDraft(event.target.value)} placeholder={activeTurnId ? 'Codex 正在执行任务…' : '描述你希望 Codex 完成的工作…'} onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); void submit(); } }} />
+        {activeTurnId ? <button onClick={() => void interrupt()}>停止</button> : <button className="primary" onClick={() => void submit()} disabled={!activeThread || !draft.trim()}>发送</button>}
       </div>
     </section>
     <aside className="interactions">
@@ -160,6 +199,50 @@ function EventCard({ event }: { event: EventRecord }) {
   const payload = event.payload as Record<string, unknown>;
   const text = typeof payload.delta === 'string' ? payload.delta : typeof payload.text === 'string' ? payload.text : undefined;
   return <article className="message"><code>{event.kind}</code>{text ? <p>{text}</p> : <pre>{JSON.stringify(payload, null, 2)}</pre>}</article>;
+}
+
+function historyEvents(result: Record<string, unknown>, threadId: string): EventRecord[] {
+  const thread = object(result.thread);
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const records: EventRecord[] = [];
+  for (const turn of turns) {
+    const turnObject = object(turn);
+    const items = Array.isArray(turnObject?.items) ? turnObject.items : [];
+    for (const item of items) {
+      const record = object(item);
+      if (!record || typeof record.type !== 'string') continue;
+      const seq = records.length + 1;
+      if (record.type === 'userMessage') {
+        const content = Array.isArray(record.content) ? record.content : [];
+        const text = content.map((part) => { const element = object(part); return typeof element?.text === 'string' ? element.text : typeof element?.path === 'string' ? `@${element.path}` : '[附件]'; }).join('\n');
+        records.push({ type: 'history', kind: 'ui.user_message', threadId, seq, payload: { text } });
+      } else if (record.type === 'agentMessage' && typeof record.text === 'string') {
+        records.push({ type: 'history', kind: 'codex.item/agentMessage', threadId, seq, payload: { text: record.text } });
+      } else {
+        records.push({ type: 'history', kind: `codex.item/${record.type}`, threadId, seq, payload: record });
+      }
+    }
+  }
+  return records;
+}
+
+function runningTurnId(result: Record<string, unknown>): string | undefined {
+  const thread = object(result.thread);
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  for (const turn of turns) {
+    const record = object(turn);
+    if (record?.status === 'inProgress' && typeof record.id === 'string') return record.id;
+  }
+  return undefined;
+}
+
+function object(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function withoutKey<T>(source: Record<string, T>, key: string): Record<string, T> {
+  const { [key]: _, ...remaining } = source;
+  return remaining;
 }
 
 function InteractionCard({ interaction, resolve }: { interaction: Interaction; resolve(interaction: Interaction, result: Record<string, unknown>): Promise<void> }) {

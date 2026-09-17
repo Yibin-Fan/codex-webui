@@ -6,9 +6,12 @@ import type { JsonObject } from './types.js';
 
 class FakeAdapter extends CodexAdapter {
   responses: Array<{ id: string | number; result: JsonObject }> = [];
+  calls: string[] = [];
 
   override async request(method: string): Promise<JsonObject> {
-    if (method === 'thread/list') return { data: [] };
+    this.calls.push(method);
+    if (method === 'thread/list') return { data: [{ id: 'thr_1', cwd: '/workspace' }] };
+    if (method === 'turn/start') return { turn: { id: 'turn_1' } };
     return {};
   }
 
@@ -48,6 +51,36 @@ test('requires bootstrap authentication and only accepts a matching command appr
     const resolved = await webUi.app.inject({ method: 'POST', url: `/api/interactions/${interaction.id}/resolve`, headers: { cookie }, payload: { result: { decision: 'decline' } } });
     assert.equal(resolved.statusCode, 202);
     assert.deepEqual(adapter.responses, [{ id: 7, result: { decision: 'decline' } }]);
+  } finally {
+    await webUi.close();
+  }
+});
+
+test('limits turns to listed workspace threads and de-duplicates a completed submission', async () => {
+  const adapter = new FakeAdapter();
+  const webUi = await createWebUi({ workspace: '/workspace', bootstrapToken: 'test-bootstrap-token', adapter });
+  try {
+    const bootstrap = await webUi.app.inject({ method: 'POST', url: '/api/auth/bootstrap', headers: { 'x-bootstrap-token': 'test-bootstrap-token' } });
+    const setCookie = bootstrap.headers['set-cookie'];
+    const cookie = (Array.isArray(setCookie) ? setCookie[0] : setCookie)?.split(';')[0];
+    assert.ok(cookie);
+
+    const unknown = await webUi.app.inject({ method: 'GET', url: '/api/threads/other-thread', headers: { cookie } });
+    assert.equal(unknown.statusCode, 404);
+    assert.deepEqual(adapter.calls, []);
+
+    const listed = await webUi.app.inject({ method: 'GET', url: '/api/threads', headers: { cookie } });
+    assert.equal(listed.statusCode, 200);
+
+    const payload = { text: 'Summarize this repository', clientRequestId: 'client-request-1' };
+    const first = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: { cookie }, payload });
+    assert.equal(first.statusCode, 202);
+    const repeated = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: { cookie }, payload });
+    assert.equal(repeated.statusCode, 202);
+    assert.equal(adapter.calls.filter((method) => method === 'turn/start').length, 1);
+
+    const changed = await webUi.app.inject({ method: 'POST', url: '/api/threads/thr_1/turns', headers: { cookie }, payload: { ...payload, text: 'Different text' } });
+    assert.equal(changed.statusCode, 409);
   } finally {
     await webUi.close();
   }
