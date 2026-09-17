@@ -1,4 +1,5 @@
 import { StrictMode, useEffect, useMemo, useState } from 'react';
+import { emptyToolProjection, projectToolEvent, type ProjectedItem, type ToolProjection } from './tool-projection.js';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
@@ -33,6 +34,7 @@ function App() {
   const [activeThread, setActiveThread] = useState<string>();
   const [historyByThread, setHistory] = useState<Record<string, EventRecord[]>>({});
   const [activeTurns, setActiveTurns] = useState<Record<string, string>>({});
+  const [toolProjection, setToolProjection] = useState<ToolProjection>(emptyToolProjection);
   const [draft, setDraft] = useState('');
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [interactions, setInteractions] = useState<Interaction[]>([]);
@@ -43,6 +45,8 @@ function App() {
     ...events.filter((event) => !activeThread || event.threadId === activeThread)
   ], [events, activeThread, historyByThread]);
   const activeTurnId = activeThread ? activeTurns[activeThread] : undefined;
+  const activeItems = useMemo(() => Object.values(toolProjection.items).filter((item) => item.threadId === activeThread), [toolProjection.items, activeThread]);
+  const activeDiff = activeTurnId && activeThread ? toolProjection.diffs[`${activeThread}:${activeTurnId}`] : undefined;
 
   async function loadThreads() {
     const result = await request<{ data?: Thread[]; threads?: Thread[] }>('/api/threads');
@@ -59,6 +63,7 @@ function App() {
       const result = await request<Record<string, unknown>>(`/api/threads/${encodeURIComponent(threadId)}`);
       const entries = historyEvents(result, threadId);
       setHistory((current) => ({ ...current, [threadId]: entries }));
+      setToolProjection((current) => ({ ...current, items: Object.fromEntries(Object.entries(current.items).filter(([, item]) => item.threadId !== threadId)) }));
       const runningTurn = runningTurnId(result);
       setActiveTurns((current) => runningTurn ? { ...current, [threadId]: runningTurn } : withoutKey(current, threadId));
     } catch (cause) {
@@ -109,6 +114,7 @@ function App() {
       if (event.kind === 'codex.turn/completed' && event.threadId) {
         setActiveTurns((current) => withoutKey(current, event.threadId!));
       }
+      setToolProjection((current) => projectToolEvent(current, event));
       setEvents((current) => [...current.slice(-499), event]);
     };
     socket.onclose = () => setStatus((current) => `${current} · 实时连接已断开`);
@@ -179,6 +185,7 @@ function App() {
       {error && <div className="error" role="alert">{error}</div>}
       <div className="timeline">
         {activeEvents.map((event, index) => <EventCard key={`${event.seq}-${index}`} event={event} />)}
+        {activeItems.map((item) => <LiveItemCard key={item.id} item={item} />)}
         {activeEvents.length === 0 && <p className="empty">选择或新建会话后开始工作。</p>}
       </div>
       <div className="composer">
@@ -187,6 +194,8 @@ function App() {
       </div>
     </section>
     <aside className="interactions">
+      <h2>本轮变更</h2>
+      {activeDiff ? <details className="diff" open><summary>查看统一 diff</summary><pre>{activeDiff}</pre></details> : <p className="empty">本回合尚未产生文件变更。</p>}
       <h2>待处理</h2>
       {interactions.length === 0 && <p className="empty">没有待处理的审批或问题。</p>}
       {interactions.map((interaction) => <InteractionCard key={interaction.id} interaction={interaction} resolve={resolveInteraction} />)}
@@ -196,9 +205,27 @@ function App() {
 
 function EventCard({ event }: { event: EventRecord }) {
   if (event.kind === 'ui.user_message') return <article className="message user">{(event.payload as { text: string }).text}</article>;
+  if (event.kind.startsWith('codex.item/') && event.kind !== 'codex.item/agentMessage') return null;
   const payload = event.payload as Record<string, unknown>;
   const text = typeof payload.delta === 'string' ? payload.delta : typeof payload.text === 'string' ? payload.text : undefined;
   return <article className="message"><code>{event.kind}</code>{text ? <p>{text}</p> : <pre>{JSON.stringify(payload, null, 2)}</pre>}</article>;
+}
+
+function LiveItemCard({ item }: { item: ProjectedItem }) {
+  if (item.type === 'agentMessage') return <article className="message"><p>{item.text ?? ''}</p></article>;
+  if (item.type === 'commandExecution') return <article className="tool-card"><div className="tool-heading"><strong>命令</strong><span>{item.status ?? '运行中'}</span></div><code>{item.command ?? '命令执行中'}</code>{item.cwd && <p className="metadata">{item.cwd}</p>}{item.output && <pre>{item.output}</pre>}</article>;
+  if (item.type === 'fileChange') return <article className="tool-card"><div className="tool-heading"><strong>文件变更</strong><span>{item.status ?? '准备中'}</span></div><ul>{(item.changes ?? []).map((change, index) => <li key={index}>{changeLabel(change)}</li>)}</ul></article>;
+  if (item.type === 'mcpToolCall') return <article className="tool-card"><div className="tool-heading"><strong>MCP 工具</strong><span>{item.status ?? '运行中'}</span></div><code>{item.server ?? 'server'} / {item.tool ?? 'tool'}</code><pre>{JSON.stringify(item.arguments ?? item.result ?? item.error, null, 2)}</pre></article>;
+  if (item.type === 'reasoning' || item.type === 'plan') return <article className="tool-card"><div className="tool-heading"><strong>{item.type === 'plan' ? '计划' : '推理摘要'}</strong></div><pre>{JSON.stringify(item, null, 2)}</pre></article>;
+  return <article className="tool-card"><div className="tool-heading"><strong>{item.type}</strong><span>{item.status ?? '完成'}</span></div></article>;
+}
+
+function changeLabel(change: unknown): string {
+  const record = object(change);
+  if (!record) return '未知文件变更';
+  const path = typeof record.path === 'string' ? record.path : typeof record.filePath === 'string' ? record.filePath : '未知路径';
+  const kind = typeof record.kind === 'string' ? record.kind : object(record.kind)?.type;
+  return typeof kind === 'string' ? `${kind}: ${path}` : path;
 }
 
 function historyEvents(result: Record<string, unknown>, threadId: string): EventRecord[] {

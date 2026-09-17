@@ -16,6 +16,10 @@ nav { display: grid; gap: 6px; margin-top: 16px; }
 header { border-bottom: 1px solid #30363d; color: #8b949e; padding: 14px 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .timeline { padding: 20px; overflow: auto; display: grid; gap: 12px; align-content: start; }
 .message, .interaction { border: 1px solid #30363d; border-radius: 8px; background: #161b22; padding: 12px; overflow: auto; }
+.tool-card { border: 1px solid #30363d; border-radius: 8px; background: #111827; padding: 12px; overflow: auto; }
+.tool-card ul { margin: 9px 0 0; padding-left: 18px; }
+.tool-heading { display: flex; justify-content: space-between; gap: 10px; color: #c9d1d9; margin-bottom: 8px; }
+.tool-heading span, .metadata { color: #8b949e; font-size: 12px; margin: 6px 0; }
 .message.user { background: #1f6feb22; white-space: pre-wrap; }
 code { color: #79c0ff; font-size: 12px; }
 pre { margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; color: #c9d1d9; font-size: 12px; }
@@ -25,6 +29,8 @@ textarea { min-height: 78px; flex: 1; resize: vertical; color: inherit; backgrou
 .empty { color: #8b949e; }
 h2 { font-size: 14px; margin: 0 0 14px; }
 .interaction { margin-bottom: 12px; }
+.diff { border: 1px solid #30363d; border-radius: 8px; padding: 10px; margin-bottom: 18px; background: #161b22; }
+.diff summary { cursor: pointer; color: #79c0ff; }
 .interaction div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .question { display: grid; gap: 5px; margin: 10px 0; font-size: 13px; }
 select { color: inherit; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 7px; }
