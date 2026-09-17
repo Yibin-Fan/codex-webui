@@ -57,6 +57,7 @@ function App() {
   const [activeThread, setActiveThread] = useState<string>();
   const [historyByThread, setHistory] = useState<Record<string, EventRecord[]>>({});
   const [activeTurns, setActiveTurns] = useState<Record<string, string>>({});
+  const [latestTurns, setLatestTurns] = useState<Record<string, string>>({});
   const [toolProjection, setToolProjection] = useState<ToolProjection>(emptyToolProjection);
   const [draft, setDraft] = useState('');
   const [events, setEvents] = useState<EventRecord[]>([]);
@@ -69,8 +70,9 @@ function App() {
     ...events.filter((event) => !activeThread || event.threadId === activeThread)
   ], [events, activeThread, historyByThread]);
   const activeTurnId = activeThread ? activeTurns[activeThread] : undefined;
+  const displayedTurnId = activeThread ? activeTurnId ?? latestTurns[activeThread] : undefined;
   const activeItems = useMemo(() => Object.values(toolProjection.items).filter((item) => item.threadId === activeThread), [toolProjection.items, activeThread]);
-  const activeDiff = activeTurnId && activeThread ? toolProjection.diffs[`${activeThread}:${activeTurnId}`] : undefined;
+  const activeDiff = displayedTurnId && activeThread ? toolProjection.diffs[`${activeThread}:${displayedTurnId}`] : undefined;
 
   async function loadThreads() {
     const result = await request<{ data?: Thread[]; threads?: Thread[] }>('/api/threads');
@@ -94,6 +96,8 @@ function App() {
       }));
       const runningTurn = runningTurnId(result);
       setActiveTurns((current) => runningTurn ? { ...current, [threadId]: runningTurn } : withoutKey(current, threadId));
+      const latestTurn = latestTurnId(result);
+      if (latestTurn) setLatestTurns((current) => ({ ...current, [threadId]: latestTurn }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法读取会话历史。');
     }
@@ -153,7 +157,10 @@ function App() {
       }
       if (event.kind === 'codex.turn/started' && event.threadId) {
         const turnId = (event.payload as { turn?: { id?: unknown } }).turn?.id;
-        if (typeof turnId === 'string') setActiveTurns((current) => ({ ...current, [event.threadId!]: turnId }));
+        if (typeof turnId === 'string') {
+          setActiveTurns((current) => ({ ...current, [event.threadId!]: turnId }));
+          setLatestTurns((current) => ({ ...current, [event.threadId!]: turnId }));
+        }
       }
       if (event.kind === 'codex.turn/completed' && event.threadId) setActiveTurns((current) => withoutKey(current, event.threadId!));
       setToolProjection((current) => projectToolEvent(current, event));
@@ -223,7 +230,10 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ text, clientRequestId: crypto.randomUUID() })
       });
-      if (result.turn?.id) setActiveTurns((current) => ({ ...current, [activeThread]: result.turn!.id! }));
+      if (result.turn?.id) {
+        setActiveTurns((current) => ({ ...current, [activeThread]: result.turn!.id! }));
+        setLatestTurns((current) => ({ ...current, [activeThread]: result.turn!.id! }));
+      }
       setEvents((current) => [...current, { type: 'event', kind: 'ui.user_message', payload: { text }, threadId: activeThread, seq: Number.MAX_SAFE_INTEGER }]);
     } catch (cause) {
       setDraft(text);
@@ -273,7 +283,7 @@ function App() {
       </div>
     </section>
     <aside className="interactions">
-      <h2>本轮变更</h2>
+      <h2>{activeTurnId ? '本轮变更' : '最近回合变更'}</h2>
       {activeDiff ? <details className="diff" open><summary>查看统一 diff</summary><pre>{activeDiff}</pre></details> : <p className="empty">本回合尚未产生文件变更。</p>}
       <h2>待处理</h2>
       {interactions.length === 0 && <p className="empty">没有待处理的审批或问题。</p>}
@@ -338,6 +348,16 @@ function runningTurnId(result: Record<string, unknown>): string | undefined {
   for (const turn of turns) {
     const record = object(turn);
     if (record?.status === 'inProgress' && typeof record.id === 'string') return record.id;
+  }
+  return undefined;
+}
+
+function latestTurnId(result: Record<string, unknown>): string | undefined {
+  const thread = object(result.thread);
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  for (const turn of [...turns].reverse()) {
+    const record = object(turn);
+    if (typeof record?.id === 'string') return record.id;
   }
   return undefined;
 }
