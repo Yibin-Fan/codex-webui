@@ -6,6 +6,7 @@ import fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { CodexAdapter, CodexUnavailableError } from './codex-adapter.js';
+import { EventBuffer, type EventCursor } from './event-buffer.js';
 import type { JsonObject, PendingInteraction, RpcMessage, WebEvent } from './types.js';
 
 const SESSION_COOKIE = 'codex_webui_session';
@@ -35,6 +36,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   const submittedRequests = new Map<string, { threadId: string; payloadHash: string; response?: JsonObject }>();
   const interactions = new Map<string, PendingInteraction>();
   const clients = new Set<WebSocket>();
+  const eventBuffer = new EventBuffer();
   let seq = 0;
   let epoch = randomBytes(16).toString('hex');
 
@@ -51,6 +53,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
       payload
     };
     const encoded = JSON.stringify(event);
+    eventBuffer.append(event);
     options.onEvent?.(event);
     for (const client of clients) {
       if (client.readyState === client.OPEN) client.send(encoded);
@@ -85,8 +88,10 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
   adapter.on('unavailable', (error: Error) => {
     interactions.clear();
+    activeTurns.clear();
     epoch = randomBytes(16).toString('hex');
     seq = 0;
+    eventBuffer.clear();
     emit('codex.unavailable', { message: error.message });
   });
 
@@ -241,7 +246,9 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   const socketServer = new WebSocketServer({ noServer: true });
-  socketServer.on('connection', (socket) => {
+  socketServer.on('connection', (socket, request) => {
+    const target = new URL(request.url ?? '/', 'http://127.0.0.1');
+    const replay = eventBuffer.replay(cursorFrom(target));
     clients.add(socket);
     const snapshot: WebEvent = {
       protocolVersion: 1,
@@ -251,7 +258,10 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
       kind: 'snapshot',
       payload: {
         connection: adapter.isAvailable ? 'ready' : 'unavailable',
-        pendingInteractions: [...interactions.values()]
+        activeTurns: Object.fromEntries(activeTurns),
+        pendingInteractions: [...interactions.values()],
+        resync: replay.resync,
+        events: replay.events
       }
     };
     socket.send(JSON.stringify(snapshot));
@@ -294,6 +304,14 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
 function threadList(result: JsonObject): Array<{ id: string }> {
   const data = Array.isArray(result.data) ? result.data : [];
   return data.filter((thread): thread is { id: string } => isJsonObject(thread) && typeof thread.id === 'string');
+}
+
+function cursorFrom(target: URL): EventCursor | undefined {
+  const epoch = target.searchParams.get('epoch');
+  const rawSeq = target.searchParams.get('seq');
+  if (!epoch || rawSeq === null || !/^\d+$/.test(rawSeq)) return undefined;
+  const seq = Number(rawSeq);
+  return Number.isSafeInteger(seq) ? { epoch, seq } : undefined;
 }
 
 function sameToken(left: string, right: string): boolean {

@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useMemo, useState } from 'react';
+import { StrictMode, useEffect, useMemo, useRef, useState } from 'react';
 import { emptyToolProjection, projectToolEvent, type ProjectedItem, type ToolProjection } from './tool-projection.js';
 import { createRoot } from 'react-dom/client';
 import './style.css';
@@ -9,6 +9,17 @@ type EventRecord = {
   payload: unknown;
   threadId?: string;
   seq: number;
+  epoch?: string;
+};
+
+type EventCursor = { epoch: string; seq: number };
+
+type SnapshotPayload = {
+  connection?: string;
+  activeTurns?: Record<string, string>;
+  pendingInteractions?: Interaction[];
+  resync?: boolean;
+  events?: EventRecord[];
 };
 
 type Interaction = {
@@ -39,6 +50,7 @@ function App() {
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [error, setError] = useState<string>();
+  const cursorRef = useRef<EventCursor | undefined>(undefined);
 
   const activeEvents = useMemo(() => [
     ...(activeThread ? historyByThread[activeThread] ?? [] : []),
@@ -63,7 +75,10 @@ function App() {
       const result = await request<Record<string, unknown>>(`/api/threads/${encodeURIComponent(threadId)}`);
       const entries = historyEvents(result, threadId);
       setHistory((current) => ({ ...current, [threadId]: entries }));
-      setToolProjection((current) => ({ ...current, items: Object.fromEntries(Object.entries(current.items).filter(([, item]) => item.threadId !== threadId)) }));
+      setToolProjection((current) => ({
+        items: Object.fromEntries(Object.entries(current.items).filter(([, item]) => item.threadId !== threadId)),
+        diffs: Object.fromEntries(Object.entries(current.diffs).filter(([key]) => !key.startsWith(`${threadId}:`)))
+      }));
       const runningTurn = runningTurnId(result);
       setActiveTurns((current) => runningTurn ? { ...current, [threadId]: runningTurn } : withoutKey(current, threadId));
     } catch (cause) {
@@ -94,31 +109,82 @@ function App() {
   useEffect(() => {
     if (!ready) return;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${location.host}/api/events`);
-    socket.onmessage = (message) => {
-      const event = JSON.parse(message.data) as EventRecord;
-      if (event.type === 'snapshot') {
-        const pending = (event.payload as { pendingInteractions?: Interaction[] }).pendingInteractions ?? [];
-        setInteractions(pending);
-        return;
+    let socket: WebSocket | undefined;
+    let reconnectTimer: number | undefined;
+    let stopped = false;
+    let delay = 500;
+
+    const applyEvent = (event: EventRecord) => {
+      if (event.epoch) {
+        const cursor = cursorRef.current;
+        if (cursor?.epoch === event.epoch && event.seq <= cursor.seq) return;
+        if (cursor && cursor.epoch !== event.epoch) {
+          setEvents([]);
+          setToolProjection(emptyToolProjection());
+          setInteractions([]);
+          setActiveTurns({});
+        }
+        cursorRef.current = { epoch: event.epoch, seq: event.seq };
       }
-      if (event.kind === 'interaction.requested') setInteractions((current) => [...current, event.payload as Interaction]);
+      if (event.kind === 'interaction.requested') {
+        const interaction = event.payload as Interaction;
+        setInteractions((current) => current.some((item) => item.id === interaction.id) ? current : [...current, interaction]);
+      }
       if (event.kind === 'interaction.submitted') {
         const id = (event.payload as { id: string }).id;
         setInteractions((current) => current.filter((interaction) => interaction.id !== id));
+      }
+      if (event.kind === 'codex.unavailable') {
+        setInteractions([]);
+        setActiveTurns({});
       }
       if (event.kind === 'codex.turn/started' && event.threadId) {
         const turnId = (event.payload as { turn?: { id?: unknown } }).turn?.id;
         if (typeof turnId === 'string') setActiveTurns((current) => ({ ...current, [event.threadId!]: turnId }));
       }
-      if (event.kind === 'codex.turn/completed' && event.threadId) {
-        setActiveTurns((current) => withoutKey(current, event.threadId!));
-      }
+      if (event.kind === 'codex.turn/completed' && event.threadId) setActiveTurns((current) => withoutKey(current, event.threadId!));
       setToolProjection((current) => projectToolEvent(current, event));
       setEvents((current) => [...current.slice(-499), event]);
     };
-    socket.onclose = () => setStatus((current) => `${current} · 实时连接已断开`);
-    return () => socket.close();
+
+    const connect = () => {
+      const cursor = cursorRef.current;
+      const query = cursor ? `?epoch=${encodeURIComponent(cursor.epoch)}&seq=${cursor.seq}` : '';
+      socket = new WebSocket(`${protocol}//${location.host}/api/events${query}`);
+      socket.onopen = () => { delay = 500; };
+      socket.onmessage = (message) => {
+        const event = JSON.parse(message.data) as EventRecord;
+        if (event.type !== 'snapshot') {
+          applyEvent(event);
+          return;
+        }
+        const payload = event.payload as SnapshotPayload;
+        const replay = Array.isArray(payload.events) ? payload.events : [];
+        if (payload.resync) {
+          cursorRef.current = undefined;
+          setEvents([]);
+          setToolProjection(emptyToolProjection());
+        }
+        setInteractions(payload.pendingInteractions ?? []);
+        setActiveTurns(payload.activeTurns ?? {});
+        replay.forEach(applyEvent);
+        if (event.epoch) cursorRef.current = { epoch: event.epoch, seq: event.seq };
+        if (payload.connection === 'ready') setStatus((current) => current.replace(' · 实时连接暂时断开，正在重连…', ''));
+      };
+      socket.onclose = () => {
+        if (stopped) return;
+        setStatus((current) => current.includes('实时连接暂时断开') ? current : `${current} · 实时连接暂时断开，正在重连…`);
+        reconnectTimer = window.setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 10_000);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
   }, [ready]);
 
   async function createThread() {
