@@ -48,7 +48,7 @@ npm run build
 
 ## 安全模型
 
-服务仅监听本机回环地址。浏览器通过启动链接中的短随机 token 建立 HttpOnly 会话；token 不放入 API 返回体。浏览器不直接连接 Codex app-server，网关只公开必要的会话、回合和审批接口。
+服务仅监听本机回环地址。浏览器通过启动链接中的一次性随机 token 建立 HttpOnly 会话；token 不放入 API 返回体。所有变更请求需要同源 Origin 和 CSRF token，WebSocket 同样校验 cookie、Host 与 Origin。浏览器不直接连接 Codex app-server，网关只公开必要的会话、回合和审批接口。
 
 Codex 的文件、Shell 和网络权限仍由你的 Codex 配置及每次审批控制。该项目不会复制 `~/.codex` 中的登录凭证，也不会提供通用 Shell API。请不要将本地端口暴露到局域网或互联网。
 

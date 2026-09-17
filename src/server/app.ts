@@ -10,6 +10,7 @@ import { EventBuffer, type EventCursor } from './event-buffer.js';
 import type { JsonObject, PendingInteraction, RpcMessage, WebEvent } from './types.js';
 
 const SESSION_COOKIE = 'codex_webui_session';
+const CSRF_COOKIE = 'codex_webui_csrf';
 const API_PREFIX = '/api/';
 
 export interface CreateWebUiOptions {
@@ -31,6 +32,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   const app = fastify({ logger: false, bodyLimit: 1_048_576 });
   const adapter = options.adapter ?? new CodexAdapter();
   const bootstrapToken = options.bootstrapToken ?? randomBytes(32).toString('base64url');
+  const authenticatedSessions = new Map<string, string>();
   const sessions = new Set<string>();
   const activeTurns = new Map<string, string>();
   const submittedRequests = new Map<string, { threadId: string; payloadHash: string; response?: JsonObject }>();
@@ -39,8 +41,21 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   const eventBuffer = new EventBuffer();
   let seq = 0;
   let epoch = randomBytes(16).toString('hex');
+  let bootstrapTokenUsed = false;
 
   await app.register(cookie);
+
+  app.addHook('onRequest', async (request, reply) => {
+    if (!isTrustedHost(request.headers.host)) return reply.code(400).send({ code: 'invalid_host', message: 'This service only accepts loopback hosts.' });
+  });
+  app.addHook('onSend', async (_request, reply, payload) => {
+    reply.header('Content-Security-Policy', "default-src 'self'; base-uri 'none'; connect-src 'self' ws: wss:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'");
+    reply.header('Cross-Origin-Opener-Policy', 'same-origin');
+    reply.header('Cross-Origin-Resource-Policy', 'same-origin');
+    reply.header('Referrer-Policy', 'no-referrer');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    return payload;
+  });
 
   const emit = (kind: string, payload: unknown, threadId?: string): WebEvent => {
     const event: WebEvent = {
@@ -96,7 +111,8 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   function isAuthenticated(request: FastifyRequest): boolean {
-    return request.cookies[SESSION_COOKIE] === bootstrapToken;
+    const sessionId = request.cookies[SESSION_COOKIE];
+    return typeof sessionId === 'string' && authenticatedSessions.has(sessionId);
   }
 
   function authenticate(request: FastifyRequest, reply: { code(statusCode: number): { send(value: unknown): unknown } }): boolean {
@@ -107,13 +123,35 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
     return true;
   }
 
+  function authenticateMutation(request: FastifyRequest, reply: { code(statusCode: number): { send(value: unknown): unknown } }): boolean {
+    if (!authenticate(request, reply)) return false;
+    const sessionId = request.cookies[SESSION_COOKIE]!;
+    const csrfToken = authenticatedSessions.get(sessionId)!;
+    if (!isSameOrigin(request.headers.origin, request.headers.host) || typeof request.headers['x-csrf-token'] !== 'string' || !sameToken(request.headers['x-csrf-token'], csrfToken)) {
+      reply.code(403).send({ code: 'forbidden', message: 'This request must come from the local WebUI.' });
+      return false;
+    }
+    return true;
+  }
+
   app.post('/api/auth/bootstrap', async (request, reply) => {
     const candidate = request.headers['x-bootstrap-token'];
-    if (typeof candidate !== 'string' || !sameToken(candidate, bootstrapToken)) {
+    if (!isSameOrigin(request.headers.origin, request.headers.host) || bootstrapTokenUsed || typeof candidate !== 'string' || !sameToken(candidate, bootstrapToken)) {
       return reply.code(401).send({ code: 'unauthorized', message: 'The launch link is invalid or has expired.' });
     }
-    reply.setCookie(SESSION_COOKIE, bootstrapToken, {
+    bootstrapTokenUsed = true;
+    const sessionId = randomBytes(32).toString('base64url');
+    const csrfToken = randomBytes(32).toString('base64url');
+    authenticatedSessions.set(sessionId, csrfToken);
+    reply.setCookie(SESSION_COOKIE, sessionId, {
       httpOnly: true,
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 8 * 60 * 60,
+      secure: false
+    });
+    reply.setCookie(CSRF_COOKIE, csrfToken, {
+      httpOnly: false,
       sameSite: 'strict',
       path: '/',
       maxAge: 8 * 60 * 60,
@@ -139,7 +177,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   app.post('/api/threads', async (request, reply) => {
-    if (!authenticate(request, reply)) return;
+    if (!authenticateMutation(request, reply)) return;
     try {
       const result = await adapter.request('thread/start', { cwd: options.workspace });
       const thread = result.thread as JsonObject | undefined;
@@ -162,7 +200,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   app.post('/api/threads/:threadId/resume', async (request, reply) => {
-    if (!authenticate(request, reply)) return;
+    if (!authenticateMutation(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
     if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     try {
@@ -175,7 +213,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   app.post('/api/threads/:threadId/turns', async (request, reply) => {
-    if (!authenticate(request, reply)) return;
+    if (!authenticateMutation(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
     if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     const body = request.body as { text?: unknown; clientRequestId?: unknown };
@@ -213,7 +251,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   app.post('/api/threads/:threadId/interrupt', async (request, reply) => {
-    if (!authenticate(request, reply)) return;
+    if (!authenticateMutation(request, reply)) return;
     const { threadId } = request.params as { threadId: string };
     if (!sessions.has(threadId)) return reply.code(404).send({ code: 'not_found', message: 'Thread is not available in this workspace.' });
     const body = request.body as { turnId?: unknown };
@@ -226,7 +264,7 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
   });
 
   app.post('/api/interactions/:interactionId/resolve', async (request, reply) => {
-    if (!authenticate(request, reply)) return;
+    if (!authenticateMutation(request, reply)) return;
     const { interactionId } = request.params as { interactionId: string };
     const interaction = interactions.get(interactionId);
     if (!interaction) return reply.code(409).send({ code: 'resolved_or_expired', message: 'This interaction has already been resolved.' });
@@ -272,7 +310,8 @@ export async function createWebUi(options: CreateWebUiOptions): Promise<RunningW
     const target = new URL(request.url ?? '/', 'http://127.0.0.1');
     if (target.pathname !== '/api/events') return;
     const rawCookie = request.headers.cookie ?? '';
-    if (!rawCookie.split(';').some((part) => part.trim() === `${SESSION_COOKIE}=${bootstrapToken}`)) {
+    const sessionId = rawCookie.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1);
+    if (!isTrustedHost(request.headers.host) || !isSameOrigin(request.headers.origin, request.headers.host) || !sessionId || !authenticatedSessions.has(sessionId)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -312,6 +351,20 @@ function cursorFrom(target: URL): EventCursor | undefined {
   if (!epoch || rawSeq === null || !/^\d+$/.test(rawSeq)) return undefined;
   const seq = Number(rawSeq);
   return Number.isSafeInteger(seq) ? { epoch, seq } : undefined;
+}
+
+function isTrustedHost(host: string | undefined): boolean {
+  return typeof host === 'string' && /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i.test(host);
+}
+
+function isSameOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin || !isTrustedHost(host)) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:' && parsed.host.toLowerCase() === host!.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function sameToken(left: string, right: string): boolean {

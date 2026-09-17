@@ -32,10 +32,22 @@ type Interaction = {
 type Thread = { id: string; name?: string | null; cwd?: string | null };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { credentials: 'same-origin', ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const csrfToken = method === 'GET' || method === 'HEAD' ? undefined : readCookie('codex_webui_csrf');
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}), ...(init?.headers ?? {}) }
+  });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(typeof body.message === 'string' ? body.message : `Request failed (${response.status}).`);
   return body as T;
+}
+
+function readCookie(name: string): string | undefined {
+  const prefix = `${name}=`;
+  const value = document.cookie.split(';').map((item) => item.trim()).find((item) => item.startsWith(prefix));
+  return value ? decodeURIComponent(value.slice(prefix.length)) : undefined;
 }
 
 function App() {
